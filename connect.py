@@ -1,98 +1,196 @@
 """
-connect.py - PySimverse connection layer.
+connect.py - ArduPilot / MAVLink
 
-Uses velocity control (send_rc_control) rather than distance moves. The
-difference matters: move_forward(100) is a commitment - the drone flies the
-whole 100 units before it will look at anything else. send_rc_control sets a
-velocity that simply persists until it is changed, so the drone keeps moving
-while a gesture is held and switches direction the instant the gesture does.
+Replaces the PySimverse version.
 
-Test the connection on its own, without the camera:
-
-    python connect.py
+Works against ArduPilot SITL now.
 """
 
-from pysimverse import Drone
+import math
+import time
+
+from pymavlink import mavutil
 
 
-# Velocity for each channel, roughly -100..100. Higher = faster.
-SPEED = 50
 
-# command -> (left_right, forward_backward, up_down, yaw)
-# All zeros means hold position, which is what "hover" is.
+CONNECTION = "udp:127.0.0.1:14550"
+
+TAKEOFF_ALT = 5.0     # metres
+SPEED = 1.0           # m/s for horizontal and vertical movement
+MAX_YAW_RATE = 0.6    # rad/s when yaw input is at full scale
+
+
 VELOCITIES = {
-    "hover":   (0, 0, 0, 0),
-    "forward": (0, SPEED, 0, 0),
-    "back":    (0, -SPEED, 0, 0),
-    "left":    (-SPEED, 0, 0, 0),
-    "right":   (SPEED, 0, 0, 0),
-    "ascend":  (0, 0, SPEED, 0),
-    "descend": (0, 0, -SPEED, 0),
+    "hover":   (0.0, 0.0, 0.0),
+    "forward": (SPEED, 0.0, 0.0),
+    "back":    (-SPEED, 0.0, 0.0),
+    "left":    (0.0, -SPEED, 0.0),
+    "right":   (0.0, SPEED, 0.0),
+    "ascend":  (0.0, 0.0, -SPEED),
+    "descend": (0.0, 0.0, SPEED),
 }
 
 
+IGNORE_POS = 0b0000000000000111
+IGNORE_ACC = 0b0000000111000000
+IGNORE_YAW = 0b0000010000000000
+TYPE_MASK = IGNORE_POS | IGNORE_ACC | IGNORE_YAW
+
+
 class DroneLink:
-    """
-    Wraps PySimverse behind a single send(command) method.
+  
 
-    Movement is a persistent velocity, not a queued action, so send() never
-    blocks and never needs to finish anything before the next command lands.
-    """
+    def __init__(self, connection=CONNECTION):
+        print(f"connecting to {connection} ...")
+        self.master = mavutil.mavlink_connection(connection)
+        self.master.wait_heartbeat()
+        print(f"heartbeat from system {self.master.target_system}")
 
-    def __init__(self):
-        self.drone = Drone()
-        self.drone.connect()
-        print("Drone connected.")
+        self._armed = False
+        self._alt = 0.0
+        self._takeoff_sent = False
+
+        # Ask for the streams we need to know what the vehicle is doing.
+        self.master.mav.request_data_stream_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1)
+
+ 
+
+    def poll(self):
+        """
+        Drain pending telemetry. Non-blocking, so it is safe to call from the
+        command loop. Keeps _armed and _alt current.
+        """
+        while True:
+            msg = self.master.recv_match(
+                type=["HEARTBEAT", "GLOBAL_POSITION_INT"], blocking=False)
+            if msg is None:
+                return
+            if msg.get_type() == "HEARTBEAT":
+                self._armed = bool(msg.base_mode &
+                                   mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            else:
+                self._alt = msg.relative_alt / 1000.0   # mm -> m
 
     @property
     def airborne(self):
-        """Ask the drone, rather than tracking a flag that can drift."""
-        try:
-            return bool(self.drone.is_flying)
-        except Exception:
-            return False
+        """Armed and actually off the ground."""
+        self.poll()
+        return self._armed and self._alt > 0.5
 
-    def send(self, command):
-        """Command string -> drone action. Unknown commands are ignored."""
+  
+    def set_mode(self, mode):
+        self.master.set_mode(self.master.mode_mapping()[mode])
+
+    def arm(self):
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+            1, 0, 0, 0, 0, 0, 0)
+
+    def takeoff(self, altitude=TAKEOFF_ALT):
+        """
+        GUIDED mode, arm, climb. Returns once the vehicle is airborne or the
+        attempt times out - it blocks, which is exactly why the app runs this
+        on the worker thread.
+        """
+        self.set_mode("GUIDED")
+        time.sleep(0.5)
+
+        self.arm()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            self.poll()
+            if self._armed:
+                break
+            time.sleep(0.2)
+        else:
+            print("[drone] arming failed - check prearm messages in SITL")
+            return
+
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+            0, 0, 0, 0, 0, 0, altitude)
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            self.poll()
+            if self._alt >= altitude * 0.9:
+                print(f"[drone] airborne at {self._alt:.1f} m")
+                return
+            time.sleep(0.3)
+        print(f"[drone] takeoff timed out at {self._alt:.1f} m")
+
+    def land(self):
+        self.stop()
+        self.set_mode("LAND")
+  
+    def send_velocity(self, vx, vy, vz, yaw_rate=0.0):
+        """One velocity setpoint. Returns immediately."""
+        self.master.mav.set_position_target_local_ned_send(
+            0,                                        # time_boot_ms
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED,
+            TYPE_MASK,
+            0, 0, 0,           # position - ignored
+            vx, vy, vz,        # velocity m/s
+            0, 0, 0,           # acceleration - ignored
+            0, yaw_rate)       # yaw angle ignored, yaw rate used
+
+    def stop(self):
+        self.send_velocity(0.0, 0.0, 0.0, 0.0)
+
+  
+    def send(self, command, yaw=0):
+      
         if command == "takeoff":
-            if not self.airborne:
-                self.drone.take_off()
+            if not self.airborne and not self._takeoff_sent:
+                self._takeoff_sent = True
+                self.takeoff()
             return
 
         if command == "land":
             if self.airborne:
-                self.stop()          # zero the velocities before landing
-                self.drone.land()
+                self.land()
+            self._takeoff_sent = False
             return
 
         if not self.airborne:
-            return                   # velocity means nothing on the ground
+            return
 
         velocity = VELOCITIES.get(command)
-        if velocity is not None:
-            self.drone.send_rc_control(*velocity)
+        if velocity is None:
+            return
 
-    def stop(self):
-        """Zero every channel - the drone holds position."""
-        self.drone.send_rc_control(0, 0, 0, 0)
+        vx, vy, vz = velocity
+        yaw_rate = (yaw / 100.0) * MAX_YAW_RATE
+        self.send_velocity(vx, vy, vz, yaw_rate)
 
 
 if __name__ == "__main__":
-    import time
-
     link = DroneLink()
+
+    print("\ntaking off ...")
     link.send("takeoff")
-    time.sleep(3)
 
-    # Each command is held for two seconds. The drone should move continuously
-    # for the whole two seconds, not hop a fixed distance and stop.
+    def hold(command, seconds, yaw=0):
+        print(f"  {command:8s} for {seconds}s  (yaw={yaw})")
+        end = time.time() + seconds
+        while time.time() < end:
+            link.send(command, yaw)
+            time.sleep(0.05)
+
     for command in ("forward", "back", "left", "right", "ascend", "descend"):
-        print("testing:", command)
-        link.send(command)
-        time.sleep(2)
-        link.send("hover")
-        time.sleep(1)
+        hold(command, 3)
+        hold("hover", 1)
 
+    print("\nturning on the spot ...")
+    hold("hover", 3, yaw=60)
+
+    print("\nlanding ...")
     link.send("land")
-    time.sleep(3)
-    print("Test routine finished.")
+    time.sleep(10)
+    print("done.")
